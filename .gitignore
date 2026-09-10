@@ -1,0 +1,14 @@
+# Local scratch files and backups
+.DS_Store
+*.bak
+*.tmp
+*.part
+__pycache__/
+work/
+backups/
+.env
+.env.*
+# Private input history and generated model assets
+*.userdb/
+sync/
+*.gram
