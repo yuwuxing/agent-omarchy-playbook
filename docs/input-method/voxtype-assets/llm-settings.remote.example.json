@@ -1,0 +1,5 @@
+{
+  "endpoint": "https://api.example.com/v1/chat/completions",
+  "model": "REPLACE_WITH_PROVIDER_MODEL_ID",
+  "api_key_env": "VOXTYPE_LLM_API_KEY"
+}

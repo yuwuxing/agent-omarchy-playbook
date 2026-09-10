@@ -1,0 +1,10 @@
+{
+  "endpoint": "http://127.0.0.1:8083/v1/chat/completions",
+  "model": "gemma-cleanup",
+  "request_options": {
+    "seed": 42,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }
+}
