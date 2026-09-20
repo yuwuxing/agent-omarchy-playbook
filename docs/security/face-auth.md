@@ -1,303 +1,547 @@
 # Omarchy 红外人脸认证：锁屏自动刷脸，唤醒重试，sudo 人脸优先
 
-> 核对日期：2026-09-20。验证状态：人脸比对、锁屏、显示器亮屏重试、sudo 与 Polkit 已验证；真正睡眠恢复及完整负向验收待实测。
+> 核对日期：2026-09-20。状态：核心场景已验证（人脸比对、锁屏刷脸、显示器亮屏重试、sudo 与 Polkit 提权）；真正睡眠恢复及完整负向验收待实测。本文面向为新电脑复现配置的 Agent。
 
-## 我想让刷脸覆盖日常认证
+## 问题与目标
 
-我在 ThinkPad X1 Carbon Gen 9 上使用 Omarchy，希望打开锁屏就能刷脸，执行 sudo 或图形提权时也优先使用人脸。识别失败时，仍然可以使用指纹和密码。
+在搭载红外摄像头的笔记本电脑上，用户希望在 Omarchy 环境中实现日常认证的无感刷脸：唤醒或点亮屏幕自动解锁，执行 `sudo` 或图形提权时优先调用人脸识别；当人脸识别超时或未匹配时，能够无缝回退至指纹或密码。
 
-要做到这一点，需要把红外采集、补光、识别引擎、PAM 和锁屏事件串起来。尤其是睡眠与亮屏：一次扫描结束以后，锁屏必须知道什么时候重新开始，不能只是把摄像头打开就算完成。
+将红外采集、补光控制、识别模型、PAM 认证链与锁屏生命周期串联起来，整体处理链路如下：
 
-我最终使用 howdy-next 处理人脸识别，通过 PAM 接入系统授权，再用 Omarchy 的用户锁屏插件处理重试。下面按这套实现的依赖关系，梳理各部分的设计与配置。
+```text
+认证触发（锁屏 / sudo / Polkit / 亮屏 / 空回车）
+→ 合盖状态检查（若合盖则跳过红外，直接走指纹/密码）
+→ 硬件红外补光开启（UVC 扩展单元）
+→ howdy-next 人脸识别（YuNet 检测 + SFace 特征比对，单线程推理）
+  ├─ 匹配成功：直接放行提权 / 解锁
+  └─ 匹配失败 / 超时：
+      ├─ 锁屏后台通道：回退至指纹等待；独立密码通道随时可输入解锁
+      └─ sudo / Polkit：顺序回退至指纹，最终回退至密码输入
+```
 
-### 我采用的认证行为
-
-我把密码保留为基础认证方式，在它之上加入以下人脸认证行为。表中描述的是实现目标，实际验证范围放在文末。
+目标认证行为定义如下：
 
 | 场景 | 需要实现的行为 |
 | --- | --- |
-| 锁屏 | 自动开始人脸识别；用户也能直接输入密码 |
-| 人脸未匹配 | 正常结束本轮扫描；有指纹设备时可继续指纹认证 |
-| 锁屏熄屏后亮屏 | 开始一轮新的识别 |
-| 系统睡眠后唤醒 | 放弃睡眠前的扫描，设备恢复后重新识别 |
-| 用户主动重试 | 提供明确的重试入口，例如锁屏空输入按 Enter |
-| sudo / 图形提权 | 优先人脸，失败后按配置转指纹或密码 |
-| 合盖、无摄像头或设备暂不可用 | 不阻塞正常的密码认证 |
-| 认证取消或锁屏已解除 | 清理扫描进程和待执行的重试 |
+| 锁屏激活 | 自动开始人脸扫描；独立密码通道维持就绪，用户可随时输入密码 |
+| 人脸未匹配 | 正常结束本轮扫描；若系统录入指纹则继续等待指纹，否则回退密码 |
+| 锁屏熄屏后亮屏 | 重新触发一轮人脸扫描 |
+| 系统睡眠后唤醒 | 放弃睡眠前的悬挂扫描，等待设备就绪后启动新一轮识别 |
+| 用户主动重试 | 提供明确入口，例如在锁屏密码框中直接按 Enter（空输入）触发重试 |
+| sudo / 图形提权 | 优先人脸识别，失败后按配置回退至指纹或密码 |
+| 合盖或设备不可用 | 检测到合盖状态时跳过红外，避免黑屏扫描超时阻塞密码认证 |
+| 认证取消或已解锁 | 立即中止正在运行的扫描子进程，清理待执行的重试定时器 |
 
-这里有一个体验上的区别：我的 sudo 和 Polkit 使用顺序执行的 PAM 链，人脸失败以后还可能等待指纹，最后才进入密码。Omarchy 锁屏则有独立的密码通道，可以在后台扫描期间输入密码。
-
-红外摄像头能改善低照度采集，但不能仅凭使用了红外，就断言系统具备经过验证的活体检测或与 Windows Hello 相同的安全能力。
+红外摄像头能有效改善低照度环境下的图像采集并过滤普通平面照片，但并不能仅凭使用红外就断言具备金融级活体防伪检测或与 Windows Hello 完全等价的安全能力。
 
 ## 环境与适用范围
 
-| 项目 | 实测基线 |
+| 项目 | 本机快照 |
 |---|---|
 | Omarchy / Hyprland | 4.0.4-1 / 0.56.2-2 |
-| 锁屏 | Omarchy Shell，Quickshell 锁屏插件 |
-| howdy-next / OpenCV | 3.4.0-1.1 本地补丁包 / 5.0.0-9 |
-| 我的电脑 | ThinkPad X1 Carbon Gen 9，Chicony IR 摄像头 |
-
-这套实现依赖可用的 IR 采集与补光，不依赖 ThinkPad 这个品牌。换一台 Omarchy 电脑时，需要重新确认摄像头接口、补光协议，以及当前版本的锁屏实现；下面的硬件参数只对应我的这台电脑。
-
-### 为什么选择这套识别引擎
-
-我选择了 howdy-next。它使用 C++ 实现，通过 OpenCV DNN 运行 YuNet 人脸检测和 SFace 身份比对，再通过 PAM 参与认证。选择它的理由包括：减少 Python/dlib 绑定的维护环节、可以检查和修改识别源码，以及能够接入已有 Linux 认证流程。
-
-我没有对所有人脸识别项目做完整横评。对这套环境而言，我更看重依赖能否维护、源码能否检查，以及 PAM 接入是否清楚。Howdy 相关包名很接近，安装时仍需要确认实际对应的项目和分支。
-
-我验证的组合是 howdy-next 3.4.0 与 OpenCV 5。它使用 C++23，推理由 OpenCV DNN 完成。换版本时，需要重新核对依赖和接口是否兼容。
-
-### 采集策略：尽量保持录入与认证一致
-
-我固定使用 IR 通道，并用这个通道录入人脸模板，让录入与认证面对相同的图像来源。
-
-我的配置围绕 IR 设备实际支持的格式、分辨率和帧率确定。每次扫描前启用补光，认证过程中保持同一个设备和配置，减少摄像头切换带来的状态与并发问题。
-
-### Omarchy 锁屏是系统接入的关键
-
-我使用的 Omarchy Shell 使用 Quickshell 锁屏，并将密码与后台生物认证分成两个 PAM 通道。人脸接入后台通道，唤醒重试由用户锁屏插件负责。这也是我先阅读锁屏 service 和插件源码的原因：需要确认认证究竟由哪一条通道启动。
-
-## 我先理清了四层依赖
-
-我把这套实现拆成四层：
-
-1. **硬件采集层**：定位 IR 摄像头，确认访问权限、采集格式和补光控制。
-2. **识别层**：配置引擎、录入用户模板，在限定时间和资源内返回匹配结果。
-3. **认证层**：把结果接入明确的 PAM 服务，保留原有账户规则与密码回退。
-4. **交互与生命周期层**：在锁屏、亮屏、睡眠恢复及主动重试时启动认证，处理取消和竞争。
-
-我按这个顺序逐层验证。先证明硬件和识别可以独立工作，再接入系统认证，最后处理锁屏事件。否则，一个“刷脸没反应”的现象可能同时涉及摄像头、权限、模型、PAM 和锁屏状态，难以定位。
-
-动手前，我检查了以下配置：
-
-- Omarchy、Hyprland、Howdy、OpenCV 和指纹库的实际版本及来源。
-- 正在运行的锁屏组件、实际使用的 PAM 服务、已有用户插件和重复启动入口。
-- Howdy 是否已经安装或被本地修改；是否存在另一个 Howdy 实现、旧摄像头切换脚本或重复 PAM 条目。
-- IR 图像接口、补光能力、活动会话的设备权限，以及已录入模板属于哪个用户和通道。
-- sudo、Polkit、密码失败控制与指纹认证原本是否正常。
-
-这些检查决定了实际修改范围。已有的 PAM 模块、监听进程和插件需要定向更新，重复添加可能造成多次扫描或相互冲突。用户文件的位置则以当前用户的 HOME / XDG 配置为准。
-
-## 修改认证前，我保留了恢复入口
-
-我将系统认证配置备份到带时间戳的 root-only 目录，并保留可用的管理会话。用户 shell 配置与插件也单独备份。区分原本已有的文件和本次新增的文件，回退时才能确定是恢复还是移除。
-
-备份范围包括将修改的 PAM 服务文件、已有 Howdy 配置、用户 shell 配置、已有锁屏插件，以及相关 systemd drop-in。记录安装包版本和服务原启用状态。人脸模板如需备份，保持私有，不提交仓库；全新环境由用户重新录入。
-
-我只合并需要修改的设置，保留原有密码认证与其它个人配置。回退时也只恢复这轮改动，避免覆盖之后的新设置。
-
-## 我的实现过程
-
-### 1. 识别 IR 设备并实现补光
-
-#### 找到真正的 IR 图像接口
-
-我先核对电脑型号、摄像头 USB 标识、视频节点能力、稳定设备路径和可用格式。一个摄像头可能暴露多个节点，其中一部分只输出元数据，并不能作为图像输入。
-
-我的电脑识别结果如下：
-
-| 项目 | 我的硬件识别结果 |
-| --- | --- |
-| 电脑 | ThinkPad X1 Carbon Gen 9 |
-| 摄像头 | Chicony，USB ID `04f2:b6ea` |
-| RGB / IR | 分别拥有独立的图像接口 |
-| IR 格式 | GREY，640×360，支持 15 FPS |
-| 稳定路径 | 通过 `/dev/v4l/by-path/` 定位到 IR 接口 |
-| 指纹 | Synaptics，USB ID `06cb:00fc` |
-
-视频节点编号可能变化，因此实现应选择经过确认的稳定标识。即使是同型号电脑，也需要重新核对设备，不能凭固定的节点编号选择相机。
-
-#### 将补光作为独立能力验证
-
-能读取灰度图像，不等于红外发射器已经开启。我把实际画面质量和补光状态单独检查，确认这个设备需要显式启用发射器。
-
-针对这台 Chicony 摄像头，我使用一个小型控制程序启用补光。它只处理已经确认的 UVC 控制项。其它硬件如果已有可用驱动或成熟工具，可以直接使用其支持的控制方式。
-
-我对这个控制程序设定了几个边界：
-
-- 只操作经过确认的目标设备与已知控制项。
-- 在写入前检查控制能力、数据长度和允许范围。
-- 需要修改时才写入，并读取结果确认设置生效。
-- 操作可重复执行，失败应明确返回，不导致认证无限等待。
-- 权限按照实际调用身份设计，优先使用现有设备访问机制，不随意增加 SUID 或开放全局写权限。
-
-我的 Chicony 摄像头的实测控制为 UVC unit 13、selector 14，数据长度两字节；启用值为 `[2, 25]`，预期最大值为 `[2, 100]`。**这些是该设备的适配结果，不是通用红外控制参数。** 另一台电脑需要重新识别控制协议，不能以试写这些值代替适配。
-
-补光应在扫描前处于可用状态。对于睡眠后会丢失设置的设备，需要在新的扫描前重新应用。扫描结束后的发射器状态、关闭策略以及是否影响其它摄像头应用，也应结合驱动行为进行验证。
-
-### 2. 安装识别引擎，完成独立比对
-
-我采用 [howdy-next](https://codeberg.org/nathawat/howdy-next) 的 AUR 包结构管理安装，并将下面的推理修复编译成一个本地包。这样，源码版本、补丁和安装文件都有明确归属，后续升级时也能检查修复是否被覆盖。
-
-构建时需要固定 release 或 commit，并检查包配方的源文件校验。模型使用所选版本提供的下载机制，记录文件名、来源和校验值；移动分支上的同名文件可能更新，不能仅凭名字认定是同一个模型。
-
-本机模型为 YuNet `face_detection_yunet_2026may.onnx` 与 SFace `face_recognition_sface_2021dec_int8.onnx`，存放于 `/usr/share/howdy/models/`；配置为 `/etc/howdy/config.ini`，个人模板为 `/etc/howdy/models/`。以目标包实际路径为准。先保持人脸 PAM 入口禁用，独立比对成功后才启用。
-
-#### 配置图像与模型
-
-我主要调整了采集设备、尺寸、帧率、扫描时长与图像预处理。配置接口以安装版本为准，例如 howdy-next 3.4.0 的设置命令使用裸键名，不带配置节前缀。
-
-我最终采用的主要参数如下：
-
-| 参数 | 我的取值 | 含义 |
-| --- | --- | --- |
-| IR 采集尺寸 | 640×360 | 与设备支持的原始格式一致 |
-| 采集帧率 | 15 FPS | 控制采集频率 |
-| 扫描超时 | 5 秒 | 限制一次尝试的等待时间 |
-| 处理高度上限 | 320 | 控制处理图像规模 |
-| CLAHE | 启用，clip limit 1.25，tile grid 8 | 对 IR 画面进行局部对比度增强 |
-| YuNet 检测阈值 | 0.6 | 判断画面中是否检测到人脸 |
-| SFace 身份阈值 | cosine 0.6942 | 判断检测到的人脸是否为已录入用户 |
-
-检测阈值与身份阈值承担不同职责。画面太暗、补光未开启或设备选错，不能靠不断放宽身份阈值解决。上述参数只在我的模型与设备组合中得到验证；更换模型或图像链路后，需要重新验证。
-
-#### 控制推理的资源消耗
-
-识别进程必须在其运行环境的资源预算内完成工作。我使用的 Howdy 版本限制了进程 CPU 时间，而 OpenCV 默认并行推理可能让多个线程累计消耗预算，在扫描的墙钟时间结束前触发 SIGXCPU。
-
-我的修复是：**在生产认证路径初始化推理后端之前，将 OpenCV 推理设置为单线程。** 原有 CPU、文件描述符、地址空间和 core dump 限制全部保留。
-
-后续更换版本时，需要先检查上游是否已有等效处理。确实需要修改时，应在源码中实现并通过发行版的包构建流程安装，使补丁可追踪、可重建。不要通过修改二进制机器码或取消整套资源限制来掩盖问题。减少摄像头 FPS 与限制推理线程数也不是同一件事。
-
-这个修改针对我遇到的运行问题；其它引擎是否需要限制线程，必须由其实现和测量结果决定。
-
-#### 现场录入，再独立验证
-
-启用补光、确认图像之后，我重新录入了自己的 IR 人脸模板。模板必须属于实际使用者，并按识别引擎要求保护存储权限。
-
-接入 PAM 之前，我先通过独立比较入口完成两次本人匹配，确认选中的是 IR 模板，并记录耗时和匹配分数。无人、遮挡和非本人测试也应纳入完整验收；我已完成和待完成的项目在文末分别列出。
-
-正常未匹配、扫描超时、设备打开失败和进程崩溃需要区分。我分别检查退出状态与匹配结果，不用“程序没有崩溃”代替“认证成功”。
-
-### 3. 接入 Omarchy 的三处认证入口
-
-我只在三个服务中接入 Howdy，并保留第四个文件作为独立密码通道：
-
-| 文件 | 要实现的修改 |
-|---|---|
-| `/etc/pam.d/sudo` | 合盖检查后，补光 → 人脸 → 指纹 → 原有密码链 |
-| `/etc/pam.d/polkit-1` | 同样采用人脸优先，保留原有账户及会话规则 |
-| `/etc/pam.d/omarchy-lock-fingerprint` | 将后台通道扩展为补光 → 人脸 → 指纹 |
-| `/etc/pam.d/omarchy-lock-password` | 保持独立密码通道与失败锁定规则，不添加人脸 |
-
-不要向 `system-auth`、`system-local-login` 全局加入人脸，也不默认修改显示管理器、SSH 或磁盘解密流程。最后检查所有 Howdy 引用，只留下有意配置的入口。
-
-#### 先读目标系统的认证结构
-
-PAM 文件名、控制标志和包含关系因发行版而异。我先检查了 sudo、图形授权和锁屏实际使用的服务，以及已有的密码、指纹和失败锁定规则。
-
-我把修改限制在日常需要刷脸的三个入口，保留其它登录流程。这样也更容易分别测试与回退。
-
-#### 系统授权的目标顺序
-
-我为 sudo 与图形授权配置的顺序是：
-
-**环境检查 → 补光准备 → 人脸认证 → 可选指纹认证 → 原有密码认证。**
-
-需要保证：
-
-- 人脸成功可完成相应认证，但不能绕过原有账户访问规则。
-- 补光失败或人脸未匹配，不应阻断密码回退。
-- 没有指纹设备时，不留下无意义的指纹等待步骤。
-- 合盖、远程会话等条件，按明确策略跳过不适用的生物认证。
-- 保留原有 account、password、session 规则，以及密码失败计数与锁定控制。
-
-若采用 PAM 的数字跳转控制，跳转数必须依据最终条目数计算。我的合盖检测跳过补光、人脸和指纹三条；删去指纹或添加其它步骤后，这个数值就不能原样保留。
-
-图形授权还有可能受到服务沙箱限制。我同时检查了实际运行 helper 的设备访问策略，设备访问权限需要与认证进程对应。更换软件版本后，这部分权限也需要重新核对，不能直接继承旧包的全部放行项。
-
-#### 我保留了锁屏的独立密码通道
-
-我使用的 Omarchy 锁屏分成两个 PAM 通道：一个处理密码，另一个处理后台生物认证。人脸接入后台通道，并在其后保留指纹；密码通道维持原有规则。
-
-这一结构使用户无需等待整轮生物认证结束，就能输入密码解锁。若较新版 Omarchy 更换了锁屏架构，应先评估其支持的扩展方式，准确实现和说明回退体验，不能仅靠把多个模块放进同一条 PAM 链就声称实现了并行密码入口。
-
-还要检查锁屏启动后台认证的条件。这个版本的原组件根据“是否录入指纹”决定是否启动后台通道。我的电脑已有指纹录入，所以保留了这个前置条件。只配人脸的电脑则需要扩展后台通道的启用条件，否则即使 PAM 已加入 Howdy，锁屏也可能根本不启动它。
-
-### 4. 在用户锁屏插件中实现重试
-
-识别引擎负责一次扫描，锁屏组件负责扫描何时开始、结束和重新开始。两者需要清晰分工。
-
-#### 三类事件需要重新认证
-
-**显示器重新亮起。** 如果锁屏仍然有效，应启动一轮新扫描。一次亮屏只触发一次，不能让随后每个鼠标移动都取消并重启认证。
-
-**系统睡眠恢复。** 睡眠前取消旧扫描，恢复后等待旧认证退出和设备就绪，再启动新扫描。我监听 systemd-logind 的 `PrepareForSleep` 信号；若较新版 Omarchy 调整了事件接口，应重新核对接入点。
-
-**用户主动重试。** 我将空输入 Enter 定义为重试人脸，非空输入仍提交密码。实现时要同时检查输入视图和认证 service，避免视图提前过滤空输入，也不能把空 Enter 当作一次失败的密码提交。
-
-#### 正确处理取消与迟到结果
-
-仅仅在事件回调中再次启动 PAM，可能造成并发扫描或旧结果干扰。我在锁屏 service 中明确记录以下状态：
-
-- 当前是否处于有效锁屏状态。
-- 是否正在睡眠或等待设备恢复。
-- 是否有认证正在运行。
-- 是否已请求取消并等待重启。
-- 当前结果是否仍属于有效的认证尝试。
-
-我围绕以下约束处理取消和重试：
-
-1. 同一后台通道不会同时运行多个扫描。
-2. 在取消旧任务之前，先标记它的结果不再有效。
-3. 旧任务退出前，不启动新任务。
-4. 连续重试请求合并处理。
-5. 取消后迟到的成功结果不能解锁。
-6. 已解锁时取消全部待执行重试。
-7. 生物认证重试不打断独立密码通道。
-
-我采用约 750ms 的重试延迟，并继续检查旧 PAM context 是否 inactive。延迟只用于平缓恢复过程，不能替代状态检查；另一台机器可能需要不同的设备就绪策略。
-
-#### 按桌面的扩展机制安装修改
-
-我通过 Omarchy 的 clone 机制创建用户锁屏插件，保留原插件的认证能力声明与替代关系。由于认证 service 常驻，文件热更新不一定替换运行中的对象，因此需要在解锁状态重新启动 shell 并验证生效。
-
-目标用户插件位于 `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/<插件 ID>/`。使用 Omarchy 的插件 clone 机制生成替代关系，修改锁屏 service 与输入视图，保留认证能力声明；通过 shell 配置确认只启用了目标插件。解锁后按该版本的 shell 重启方式加载，再查询锁屏运行状态和事件监听进程，确认运行的是新实现。
+| 锁屏架构 | Omarchy Shell（基于 Quickshell，独立密码与生物双 PAM 通道） |
+| howdy-next / OpenCV | 3.4.0-1.1（含 OpenCV 单线程推理补丁） / 5.0.0-9 |
+| 参考硬件基线 | ThinkPad X1 Carbon Gen 9，Chicony IR 摄像头，Synaptics 指纹（`06cb:00fc`） |
+| 摄像头接口 | GREY，640×360 @ 15 FPS，稳定路径位于 `/dev/v4l/by-path/` |
+| 补光控制协议 | Chicony UVC Extension Unit（Unit 13, Selector 14） |
+
+本方案的核心逻辑依赖于 Linux V4L2 视频采集、红外发射器控制、PAM 认证栈以及 Omarchy 用户锁屏插件扩展机制。硬件适配参数（如 USB ID、UVC 控制单元与稳定设备路径）来自上述参考硬件，**在新机器部署时必须重新识别硬件设备，不能直接套用硬编码参数。**
+
+## Agent 执行前检查
+
+执行前请先阅读仓库 [AGENTS.md](../../AGENTS.md) 以及环境提供的 omarchy 技能，不要修改 `/usr/share/omarchy/` 目录。以下检查命令在目标用户的 Bash 会话中运行；若分 shell 执行请重新导出变量。
+
+```bash
+FACE_CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
+FACE_DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
+FACE_WORK="$HOME/work/face-setup"
+FACE_BACKUP="$FACE_WORK/backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$FACE_WORK" "$FACE_BACKUP"
+
+# 1. 检查基础环境与版本
+cat /etc/os-release
+hyprctl version
+uname -r
+
+# 2. 检查摄像头硬件节点与红外格式
+v4l2-ctl --list-devices
+ls -l /dev/v4l/by-path/
+
+# 3. 检查现有 PAM 规则与冲突
+head -n 20 /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/omarchy-lock-* 2>/dev/null || true
+
+# 4. 检查 Polkit 提权助手运行限制
+systemctl status polkit.service --no-pager
+
+# 5. 检查锁屏插件与已录入指纹
+ls -la "$FACE_CONFIG_ROOT/omarchy/plugins/" 2>/dev/null || true
+fprintd-list "$USER" 2>/dev/null || true
+```
+
+检查时确认以下关键项：
+
+- **IR 设备节点稳定性**：确认哪个 `/dev/video*` 节点真正输出灰度图（GREY 格式），并记录对应的 `/dev/v4l/by-path/` 符号链接路径，防止重启后节点编号漂移。
+- **补光控制协议**：检查红外发射器是否需要显式开启。若为常见 UVC 设备，需确认其 vendor extension unit 与 selector；若系统已有 `linux-enable-ir-emitter` 等成熟工具，优先使用经过该工具探测的配置。
+- **现有 PAM 状态**：确认 `/etc/pam.d/sudo`、`/etc/pam.d/polkit-1` 是否已有旧版 Howdy、第三方人脸或指纹条目，避免规则叠加引起死锁或重复扫描。
+- **锁屏后台通道前置条件**：检查 Omarchy 当前锁屏插件是否限制了只有录入指纹才拉起后台通道。如果目标机没有指纹设备，需相应调整锁屏启动逻辑。
+
+## 备份
+
+修改系统认证与锁屏插件前，必须创建带时间戳的可恢复备份，并记录原先不存在的文件，确保能够完整回滚。
+
+```bash
+# 备份 PAM 认证文件（需 root 权限）
+sudo mkdir -p "$FACE_BACKUP/pam"
+for f in sudo polkit-1 omarchy-lock-fingerprint omarchy-lock-password; do
+  if [ -f "/etc/pam.d/$f" ]; then
+    sudo cp -a "/etc/pam.d/$f" "$FACE_BACKUP/pam/$f"
+  fi
+done
+
+# 备份已有 Howdy 配置与服务 drop-in
+if [ -d /etc/howdy ]; then
+  sudo cp -a /etc/howdy "$FACE_BACKUP/howdy"
+fi
+if [ -d /etc/systemd/system/polkit-agent-helper-1.service.d ]; then
+  sudo cp -a /etc/systemd/system/polkit-agent-helper-1.service.d "$FACE_BACKUP/polkit-dropin"
+else
+  printf '%s\n' "/etc/systemd/system/polkit-agent-helper-1.service.d" >> "$FACE_BACKUP/originally-absent.txt"
+fi
+
+# 备份用户锁屏插件
+if [ -d "$FACE_CONFIG_ROOT/omarchy/plugins" ]; then
+  cp -a "$FACE_CONFIG_ROOT/omarchy/plugins" "$FACE_BACKUP/omarchy-plugins"
+fi
+```
+
+人脸模板属于用户高敏感生物数据，备份仅保存在本地安全路径中，**严禁将人脸特征库、图像样本或相关凭证提交至 Git 仓库。**
+
+## 配置步骤
+
+### 1. 定位 IR 摄像头并配置补光控制
+
+#### 定位稳定图像输入路径
+
+通过 `v4l2-ctl` 枚举设备能力，找到支持灰度格式（如 `GREY` 或 `YUYV`）的红外摄像头节点。通过 `/dev/v4l/by-path/` 路径定位该节点，避免因设备插拔或热加载导致 `/dev/videoX` 编号变动。
+
+例如在参考硬件上：
+- 节点：Chicony IR 摄像头，USB ID `04f2:b6ea`
+- 格式：`GREY`，分辨率 640×360，15 FPS
+- 稳定路径：`/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4:1.2-video-index0`
+
+#### 编译轻量级 UVC 补光控制程序
+
+多数笔记本内置红外摄像头需要显式通过 UVC Extension Unit 开启发射器。在 `/usr/local/libexec/howdy-ir-emitter` 部署受限控制程序，确保每次写入前做范围检查，不执行未知固件刷写。
+
+```bash
+cat <<'EOF' > "$FACE_WORK/ir-emitter.c"
+// Bounded Chicony UVC emitter control; no scanning or firmware writes.
+// Protocol reference: github.com/PetePriority/chicony-ir-toggle (on = 2,25).
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/uvcvideo.h>
+#include <linux/usb/video.h>
+
+static int query(int fd, unsigned char request, unsigned char data[2]) {
+    struct uvc_xu_control_query q = {.unit=13,.selector=14,.query=request,.size=2,.data=data};
+    return ioctl(fd, UVCIOC_CTRL_QUERY, &q);
+}
+
+int main(int argc, char **argv) {
+    // 替换为目标电脑上实际确认的 IR 稳定路径
+    const char *device = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4:1.2-video-index0";
+    unsigned char maximum[2] = {0}, current[2] = {0}, target[2] = {2, 25};
+    if (argc > 1 && strcmp(argv[1], "off") == 0) target[0] = target[1] = 0;
+
+    int fd = open(device, O_RDWR | O_CLOEXEC);
+    if (fd < 0) { perror("open IR camera"); return 1; }
+
+    if (query(fd, UVC_GET_MAX, maximum) < 0 || maximum[0] != 2 || maximum[1] != 100) {
+        fprintf(stderr, "Unexpected emitter control; refusing to write\n");
+        close(fd);
+        return 2;
+    }
+    if (query(fd, UVC_GET_CUR, current) < 0) { perror("read emitter"); close(fd); return 3; }
+    if (memcmp(current, target, 2) != 0 && query(fd, UVC_SET_CUR, target) < 0) {
+        perror("enable emitter"); close(fd); return 4;
+    }
+    if (query(fd, UVC_GET_CUR, current) < 0 || memcmp(current, target, 2) != 0) {
+        fprintf(stderr, "Emitter readback failed\n"); close(fd); return 5;
+    }
+    printf("IR emitter: mode=%u, level=%u\n", current[0], current[1]);
+    close(fd);
+    return 0;
+}
+EOF
+
+gcc -O2 "$FACE_WORK/ir-emitter.c" -o "$FACE_WORK/howdy-ir-emitter"
+sudo install -m 755 -o root -g root "$FACE_WORK/howdy-ir-emitter" /usr/local/libexec/howdy-ir-emitter
+```
+
+运行 `/usr/local/libexec/howdy-ir-emitter` 验证发射器能正常点亮，并通过参数 `off` 测试关闭。
+
+### 2. 编译安装 howdy-next 并修复单线程推理
+
+[howdy-next](https://codeberg.org/nathawat/howdy-next) 使用 C++ 实现，通过 OpenCV DNN 运行 YuNet 人脸检测和 SFace 身份比对。
+
+#### 修复 OpenCV 推理 CPU 预算冲突（SIGXCPU）
+
+Howdy 为了防止扫描进程死锁，对进程的 CPU 时间施加了资源限制。OpenCV DNN 默认的多线程工作池会在所有核心上并行计算，导致几秒钟的墙钟扫描在累计 CPU 时间上瞬间超限，直接被系统发送 `SIGXCPU` 终止。
+
+在打包构建源码时，应用单线程推理补丁：
+
+```patch
+--- a/howdy/src/vision/face_model.cpp
++++ b/howdy/src/vision/face_model.cpp
+@@ -35,6 +35,11 @@
+ 	    : metric_(config.sface_metric)
+ 	    , threshold_(config.sface_threshold)
+ 	    , backend_(std::make_shared<Backend>()) {
++		// Authentication has a process-wide CPU-time budget. OpenCV's default
++		// worker pool spends that budget across all cores and can trigger SIGXCPU
++		// before the scan's wall-clock deadline. Small face models also avoid
++		// worker-pool overhead with serial inference. Keep sandbox limits intact.
++		cv::setNumThreads(1);
+ 		backend_->check_readiness = [](const std::filesystem::path &path) -> OpenCvModelReadiness {
+ 			return check_opencv_model_readiness_with_label(path, "OpenCV face model file",
+ 			                                               static_cast<uid_t>(0));
+```
+
+通过 PKGBUILD 编译安装带补丁的软件包，确保升级链路可追踪。
+
+#### 配置图像采集与比对模型
+
+模型文件置于 `/usr/share/howdy/models/`：
+- YuNet 人脸检测：`face_detection_yunet_2026may.onnx`
+- SFace 身份比对：`face_recognition_sface_2021dec_int8.onnx`
+
+在 `/etc/howdy/config.ini` 中配置采集参数与识别阈值：
+
+```ini
+[video]
+device_path = /dev/v4l/by-path/pci-0000:00:14.0-usb-0:4:1.2-video-index0
+max_height = 320
+frame_width = 640
+frame_height = 360
+fps = 15
+timeout = 5
+
+[video.clahe]
+enabled = true
+clip_limit = 1.25
+tile_grid_size = 8
+
+[snapshots]
+capture_failed = false
+capture_successful = false
+
+[models]
+detection = yunet
+detection_threshold = 0.6
+recognition = sface
+recognition_metric = cosine
+recognition_threshold = 0.6942
+```
+
+- `detection_threshold = 0.6`：用于判定画面中是否存在有效人脸。
+- `recognition_threshold = 0.6942`（余弦距离）：用于判定该人脸是否匹配已录入模板。
+
+### 3. 现场录入人脸模板与独立比对验证
+
+在将人脸模块接入 PAM 之前，先完成模板录入并进行独立验证。
+
+```bash
+# 录入当前用户的红外人脸模板
+sudo howdy -U "$USER" add
+
+# 执行独立测试（不接入 PAM）
+sudo howdy test
+```
+
+观察 `howdy test` 输出，确保在红外补光开启的状态下，匹配耗时稳定在 350ms–450ms 之间，余弦距离显著低于阈值。此时保持 PAM 文件不变，证明硬件、推理与权限链路全部正常后，再进入系统认证改造。
+
+### 4. 配置 Polkit 授权沙箱权限
+
+现代 systemd 环境中，Polkit agent helper 可能在受限制的沙箱单元中运行，默认无法访问视频设备节点。
+
+创建 drop-in 文件 `/etc/systemd/system/polkit-agent-helper-1.service.d/howdy.conf`：
+
+```ini
+[Service]
+PrivateDevices=no
+DeviceAllow=char-video4linux rw
+DeviceAllow=/dev/uinput rw
+```
+
+重新加载 systemd 管理器：
+
+```bash
+sudo systemctl daemon-reload
+```
+
+### 5. 接入 Omarchy PAM 认证链
+
+Omarchy 的日常认证由三处服务组成：`sudo`、`polkit-1` 以及锁屏。锁屏采用双通道架构：密码通道（`omarchy-lock-password`）与后台生物通道（`omarchy-lock-fingerprint`）。
+
+我们保持 `omarchy-lock-password` 完全不变，确保任何时候用户都能输入密码解锁。在其余三个服务中接入人脸认证。
+
+#### `/etc/pam.d/sudo`
+
+合盖检查跳过红外 → 开启补光 → 人脸识别 → 指纹备选 → 密码回退。
+
+```pam
+# Face first, then the existing fingerprint/password fallback.
+auth      [success=3 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth      optional pam_exec.so quiet /usr/local/libexec/howdy-ir-emitter
+auth      sufficient pam_howdy.so
+auth      sufficient pam_fprintd.so
+#%PAM-1.0
+auth		include		system-auth
+account		include		system-auth
+session		include		system-auth
+session		optional	pam_systemd.so class=none
+```
+
+> [!NOTE]
+> `[success=3 default=ignore]`：当笔记本处于合盖（挂接外接显示器或远程会话）状态时，`omarchy-hw-laptop-closed` 返回 0，精确跳过后续的补光、人脸与指纹 3 个模块，直接进入密码链，避免合盖时触发超时等待。
+
+#### `/etc/pam.d/polkit-1`
+
+图形提权同样配置人脸优先：
+
+```pam
+# Face first, then the existing fingerprint/password fallback.
+auth      [success=3 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth      optional pam_exec.so quiet /usr/local/libexec/howdy-ir-emitter
+auth      sufficient pam_howdy.so
+auth      sufficient pam_fprintd.so
+auth      required pam_unix.so
+
+account   required pam_unix.so
+password  required pam_unix.so
+session   required pam_unix.so
+```
+
+#### `/etc/pam.d/omarchy-lock-fingerprint`
+
+锁屏后台生物通道扩展为人脸优先、指纹备选：
+
+```pam
+#%PAM-1.0
+# IR face first, fingerprint fallback; password runs independently.
+auth       [success=3 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth       optional                  pam_exec.so quiet /usr/local/libexec/howdy-ir-emitter
+auth       sufficient                pam_howdy.so
+auth       required                  pam_fprintd.so
+account    include                   system-local-login
+```
+
+#### 检查独立密码通道
+
+确认 `/etc/pam.d/omarchy-lock-password` 保持原样，不添加任何生物认证模块。用户在锁屏界面打字提交密码时，由该通道独立处理，不受后台人脸扫描状态阻塞。
+
+### 6. 通过用户锁屏插件实现唤醒与重试
+
+Omarchy Shell 的锁屏由 Quickshell 驱动。原生插件在扫描超时后不会自动重新激活，且睡眠恢复或亮屏时缺少重试逻辑。
+
+利用 Omarchy 的插件 clone 机制，在用户目录创建定制插件 `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/${USER}.lock`。
+
+#### 插件清单 `manifest.json`
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "myuser.lock",
+  "name": "My Lock Screen",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Quickshell session lock with face/fingerprint retry and independent password flow.",
+  "omarchy": {
+    "capabilities": [
+      "authentication"
+    ],
+    "clonedFrom": "omarchy.lock"
+  },
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
+```
+
+#### 修改 `LockView.qml`：允许空回车触发人脸重试
+
+在密码输入框中，将原本必须输入非空字符才提交密码的逻辑，调整为允许空回车传递给 `Service.qml`：
+
+```qml
+// 修改占位提示
+readonly property string placeholderText: "Password / Enter for face"
+
+// 在输入框 onAccepted 中放行空回车
+onAccepted: {
+  var submitted = root.passwordText
+  root.passwordTextEdited("")
+  root.submitPassword(submitted)
+}
+```
+
+#### 修改 `Service.qml`：接入亮屏、唤醒与防抖重试状态机
+
+在 `Service.qml` 中扩展生物认证的生命周期管理：
+
+1. **状态属性追踪**：
+   ```qml
+   property bool displayBlanked: false
+   property bool systemSuspending: false
+   property bool biometricRestartPending: false
+   ```
+2. **防抖重启机制**：
+   ```qml
+   function restartBiometrics(reason) {
+     if (!lockRequested || !sessionLock.secure || !fingerprintConfigured || systemSuspending) return
+     if (biometricRestartPending) return
+     biometricRestartPending = true
+     fingerprintRetryTimer.stop()
+     // 取消正在进行的旧任务，避免旧任务迟到的成功结果影响新状态
+     if (fingerprintPam.active) fingerprintPam.abort()
+     fingerprintAuthenticating = false
+     biometricRestartTimer.restart()
+     logEvent("face-retry: " + reason)
+   }
+   ```
+3. **空回车处理**：
+   ```qml
+   function submitPassword(value) {
+     var password = String(value || "")
+     if (!lockRequested || authenticatingPassword) return
+
+     if (password.length === 0) {
+       failureMessage = ""
+       runWake()
+       restartBiometrics("enter")
+       return
+     }
+     // 非空密码按原逻辑提交至 passwordPam
+     // ...
+   }
+   ```
+4. **监听 logind 睡眠信号与显示器亮屏**：
+   ```qml
+   Process {
+     id: sleepMonitor
+     command: ["/usr/bin/gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1", "--object-path", "/org/freedesktop/login1"]
+     running: true
+     stdout: SplitParser {
+       onRead: function(line) { root.handleSleepMonitorLine(line) }
+     }
+     onExited: sleepMonitorRetry.restart()
+   }
+
+   function handleSleepSignal(sleeping) {
+     systemSuspending = sleeping
+     if (sleeping) {
+       biometricRestartPending = false
+       biometricRestartTimer.stop()
+       fingerprintRetryTimer.stop()
+       if (fingerprintPam.active) fingerprintPam.abort()
+       fingerprintAuthenticating = false
+     } else if (lockRequested) {
+       displayBlanked = false
+       runWake()
+       restartBiometrics("resume")
+     }
+   }
+   ```
+5. **重试延时定时器**：
+   设置 750ms 的 `biometricRestartTimer`，确保设备硬件与驱动完全退出旧会话后再启动新一轮 PAM 认证。
+
+### 7. 加载与生效
+
+在已解锁的桌面会话中，重启 Omarchy Shell 并检验插件加载状态：
+
+```bash
+# 重启 shell 生效用户锁屏插件
+omarchy shell restart
+
+# 检查当前启用的插件是否包含自定义锁屏
+grep -rn "myuser.lock" "$FACE_CONFIG_ROOT/omarchy/" 2>/dev/null || true
+```
 
 ## 验收
 
-安装成功不等于“摄像头亮了”，也不等于“某次比较返回成功”。我将真实使用、硬件事件和状态机测试分开记录：
+人脸认证涉及设备控制、推理性能与交互状态机，必须将独立命令行比对、提权场景与真实锁屏操作分开验证：
 
-| 测试 | 应观察到的结果 | 我的验证结果 |
-| --- | --- | --- |
-| 独立本人比对 | 多次成功，匹配正确用户，无异常信号退出 | 已验证 |
-| 无人、非本人、遮挡 | 不误认证；失败与超时正常结束 | 待完整验收 |
-| sudo | 排除凭据缓存后，确认实际通过人脸授权 | 已验证 |
-| 图形授权 | 操作成功，日志确认所用认证路径 | 已验证 |
-| 正常锁屏 | 自动刷脸成功，密码入口可用 | 刷脸已验证；密码回退待实测 |
-| 生物认证失败 | 按设计转指纹或密码，等待时间可接受 | 待实测 |
-| 主动重试 | 开始新扫描，不产生空密码失败 | 状态机通过；手动操作待实测 |
-| 熄屏再亮屏 | 只触发所需的新扫描 | 已验证 |
-| 真正睡眠再唤醒 | 旧任务退出，设备恢复，新扫描可完成 | 状态机通过；实机待验证 |
-| 取消与连续重试 | 不并发扫描，不接受迟到成功 | 状态机已验证 |
-| 合盖、设备缺失 | 遵守跳过策略，密码仍可使用 | 待实测 |
-| 暗光环境 | 验证实际补光与识别能力 | 全黑环境待实测 |
+| 操作 | 预期结果 | 实测结果 |
+|---|---|---|
+| 独立本人比对（`howdy test`） | 多次比对均成功识别本人，耗时在合理区间，无异常信号终止 | 已验证（耗时 346–407ms） |
+| 非本人 / 遮挡测试 | 明确拒绝认证，超时后正常退出，不发生误认或挂死 | 待完整负向验收 |
+| 清空凭据后执行 `sudo` | 终端触发红外补光，人脸匹配成功后直接放行提权 | 已验证 |
+| 运行图形授权（如 `pkexec whoami`） | 弹出 Polkit 授权窗口，人脸匹配成功后提权 | 已验证 |
+| 正常触发锁屏 | 屏幕锁定后自动开启红外扫描并秒解 | 已验证（解锁耗时约 568ms） |
+| 锁屏独立密码输入 | 在红外扫描过程中输入密码回车，密码能立即解锁 | 待严格实测 |
+| 锁屏空回车重试 | 密码框为空按 Enter，重新激活红外补光与人脸扫描 | 状态机测试通过 |
+| 锁屏熄屏后再点亮 | 移动鼠标或按键点亮屏幕，自动开始新一轮扫描 | 已验证 |
+| 系统睡眠挂起后唤醒 | 睡眠前终止旧扫描；唤醒恢复后重新启动人脸识别 | 状态机通过，实机待实测 |
+| 连续重试与取消 | 连续敲击 Enter 不引发多重并发扫描，旧认证被干净中止 | 状态机已验证 |
+| 合盖模式测试 | 盖上笔记本接入外接屏幕，提权操作直接进入密码/指纹提示 | 待严格实测 |
+| 全黑暗光环境 | 仅靠红外发射器补光完成人脸检测与比对 | 全黑场景待实测 |
 
-我的独立 IR 比对约为 346–407ms，真实锁屏解锁约 568ms，sudo 和 Polkit 也观察到人脸认证成功。源码测试、锁屏状态机测试及显示器亮屏重试已经验证。这些数据说明方案具有实践基础，不是其它电脑的性能承诺。
+验收时的辅助验证命令：
 
-我尚未完成真正睡眠恢复、全黑环境、单独空 Enter 操作以及完整负向回退的实机验收。新环境实施时仍必须执行这些测试，需要重新确认实际结果，也不能把状态机模拟测试当作硬件验收。
+```bash
+# 验证 sudo 人脸优先
+sudo -k
+sudo whoami
+
+# 验证 Polkit 图形提权
+pkexec whoami
+
+# 检查锁屏事件与 PAM 状态机日志
+journalctl --user -u omarchy-shell.service -f -o cat
+```
 
 ## 回滚
 
-优先禁用 Howdy 认证，使用仍可用的密码或预留管理会话操作。禁用识别引擎不一定同时移除补光调用，需要完整回退时，定向恢复本轮修改的三个 PAM 服务，保留原有密码失败控制及后续用户修改。
+当人脸识别出现异常、补光驱动故障或锁屏逻辑不符合预期时，按最小动作原则执行顺序回滚：
 
-在解锁状态停用新增用户锁屏插件，确认 clone 机制恢复原插件，再重启 shell。对本轮新建的补光程序与 systemd drop-in，先确认无剩余引用，再按变更清单移除；原本存在的文件恢复备份。服务配置发生变化时重新加载，并验收密码和原有指纹可用。
+1. **优先切断 PAM 人脸链**：
+   从备份恢复 `/etc/pam.d/sudo`、`/etc/pam.d/polkit-1` 和 `/etc/pam.d/omarchy-lock-fingerprint`，确保系统的密码与指纹认证基线立即恢复：
+   ```bash
+   sudo cp "$FACE_BACKUP/pam/"* /etc/pam.d/
+   ```
+2. **停用用户锁屏插件**：
+   在解锁状态下移除或禁用自定义锁屏插件目录，恢复原版 `omarchy.lock`，随后执行 `omarchy shell restart` 重载桌面。
+3. **移除 Polkit 提权 drop-in**：
+   ```bash
+   sudo rm -rf /etc/systemd/system/polkit-agent-helper-1.service.d/howdy.conf
+   sudo systemctl daemon-reload
+   ```
+4. **移除补光辅助程序与软件包**：
+   确认无外部引用后，移除 `/usr/local/libexec/howdy-ir-emitter`。若需卸载 howdy-next，可通过包管理器移除，但保留用户已录入的模板文件以备后续排错。
+5. **回滚验收**：
+   重新执行 `sudo -k && sudo whoami` 以及锁屏解锁，确认密码及原有指纹功能完全正常。
 
-用户模板不作为常规回滚的删除对象，不清空整个配置目录，也不在锁屏期间强制重启 shell。
+## 已知限制与踩坑
 
-## 已知限制与维护
-
-我把识别引擎打包安装，把锁屏修改留在用户插件中，就是为了让这套配置在升级后仍然能够检查和维护。
-
-识别引擎需要保留版本、构建方式和必要补丁的说明。桌面扩展应位于支持的用户配置位置。设备适配应记录硬件标识、控制协议和适用条件。所有权限调整都应能对应到实际需要访问设备的进程。
-
-后续升级时，重点检查识别补丁是否仍需要、是否被覆盖，模型是否变化，PAM 基线是否更新，以及锁屏接口是否兼容。新版已有等效修复时，可以移除本地补丁，但仍需重新验证行为。
-
-出现问题时，按“设备访问 → 补光 → 独立比对 → PAM → 锁屏事件”的顺序定位。恢复时应能禁用人脸入口并回到实施前的密码认证基线，不依赖删除整份 PAM 文件或关闭安全限制。
+- **OpenCV 多线程与 `SIGXCPU` 超限**：Howdy-next 对认证子进程设置了 CPU 时间上限；OpenCV DNN 默认的多线程推理会在多核 CPU 上瞬间耗尽该预算，导致扫描被内核信号强行杀死。必须在源码中调用 `cv::setNumThreads(1)` 强制单线程推理。
+- **PAM `[success=N]` 跳转计数绑定**：PAM 中的 `[success=3 default=ignore]` 严格依赖其后紧跟的条目数量（补光、人脸、指纹共 3 项）。如果目标机未配置指纹或增加了其他模块，必须重新计算跳转步长，否则合盖检测会跳过正常的密码认证链。
+- **锁屏双 PAM 通道 vs 单链 PAM**：Omarchy 锁屏采用了密码与后台生物分离的架构。将人脸接入后台通道并保留指纹备选，能保证用户随时输入密码而不受阻塞。但在传统的单一 PAM 链桌面（如普通 SDDM 或 GDM）上，人脸和密码是串行等待的，无法获得同等的并行解锁体验。
+- **UVC 补光控制具有硬件专属协议**：本文给出的 Unit 13 / Selector 14 参数仅对特定型号的 Chicony IR 摄像头有效。其他厂商（如 Sunplus、Realtek）的红外发射器通常采用完全不同的扩展单元或需要通过内核驱动控制，不可直接盲写。
+- **锁屏状态机的竞态处理**：亮屏与唤醒事件频繁触发时，如果不显式中止正在进行的旧 PAM 会话并设置防抖（750ms），极易产生并发采集冲突，甚至让旧尝试迟到的成功结果在异常时机触发解锁。
+- **红外生物识别的安全边界**：虽然红外成像能阻挡绝大多数普通屏幕翻拍或照片攻击，但当前开源模型（YuNet + SFace）尚未集成严格的 3D 结构光或深度活体检测算法，对高质量仿造物不具备绝对防御能力。
 
 ## 参考来源
 
-- [howdy-next](https://codeberg.org/nathawat/howdy-next)：我使用的识别引擎，依赖与推理修改以 v3.4.0 源码为依据。
-- [Chicony 补光协议参考](https://github.com/PetePriority/chicony-ir-toggle)：用于理解控制方式，设备参数以目标硬件实测为准。
-- [Omarchy](https://github.com/omacom/omarchy)：锁屏实现以目标安装版本为准；本文依据本机 4.0.4 的锁屏源码、插件机制与生效 PAM 配置。
+- [howdy-next 源码仓库](https://codeberg.org/nathawat/howdy-next)：基于 C++ 与 OpenCV DNN 的现代 Howdy 实现。
+- [Chicony IR Toggle 协议参考](https://github.com/PetePriority/chicony-ir-toggle)：Chicony 红外摄像头 UVC 控制指令参考。
+- [Omarchy 官方仓库](https://github.com/omacom/omarchy)：锁屏架构、插件机制与 PAM 默认配置基线。
+
+## 交给 Agent 的任务
+
+> 请先阅读仓库 AGENTS.md，再按本文检查并配置我的 Omarchy 系统红外人脸认证。核对 IR 摄像头设备路径与补光控制协议，应用 OpenCV 单线程推理补丁安装 howdy-next，现场录入模板并完成独立测试。在备份后定向修改 sudo、polkit-1 和锁屏生物 PAM 通道，通过用户锁屏插件实现亮屏与唤醒重试，保留独立密码通道。完成各场景验收并报告实测结果与回滚方法。
