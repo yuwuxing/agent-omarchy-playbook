@@ -20,6 +20,7 @@ Agent 入口：[执行与维护规范](AGENTS.md)。
 |---|---|---|
 | [Omarchy 中文输入法：从“能输入”到“顺手”](docs/input-method/rime.md) | Fcitx5 + 雾凇拼音、中英切换、混合输入、Wayland 候选框定位、可选长句模型 | Omarchy 4.0.2 / Hyprland 0.56.2；包含已验证结果和可选试验 |
 | [Omarchy 语音输入：按住右 Alt 说话，短句直出，长句交给 AI 整理](docs/input-method/voxtype.md) | Paraformer、短句分流、网络/本地 API、Gemma 常驻、并发与回滚 | Omarchy 4.0.2-1 / voxtype 1.0.1；本地已验证，云端待实测 |
+| [Omarchy 红外人脸认证：锁屏自动刷脸，唤醒重试，sudo 人脸优先](docs/security/face-auth.md) | IR 适配、Howdy 推理、PAM 接入、锁屏重试与密码回退 | Omarchy 4.0.4 / howdy-next 3.4.0；核心场景已验证，睡眠与完整负向验收待实测 |
 
 ## 每篇文章要回答什么
 
