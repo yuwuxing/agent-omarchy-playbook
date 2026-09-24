@@ -113,6 +113,14 @@ fc-match 'Noto Sans CJK SC'
 
 这台 Arch 机器的 librime 包已提供 `librime-lua.so` 和 `librime-octagram.so`。其他发行版可能拆成独立包，Agent 应查询包内容补齐，而不是假设所有系统都有相同包名或 `/usr/lib` 布局。Lua 是雾凇扩展所需，octagram 是语法模型所需；`librime-predict` 的“下一词预测”与本文长句模型不是一回事。
 
+同时检查 Rime 核心共享库的动态链接完整性，预防 Arch/Omarchy 滚动更新导致 `opencc` 与 `librime` 的 soname 不匹配（例如缺少 `libopencc.so.1.2` 导致模块静默损坏打不出字）：
+
+```bash
+ldd /usr/lib/fcitx5/librime.so | grep -i "not found"
+```
+
+若出现缺失，需同步升级运行库：`sudo pacman -Syu opencc librime fcitx5-rime`。
+
 ## 4. 启动与应用通信：先保证每一层工作
 
 ### 4.1 只保留一个启动入口
@@ -253,7 +261,11 @@ patch:
 
 没有增加“右 Shift 临时英文”模式，没有改动全局状态记忆。本文快照中 Fcitx `ShareInputState=No`，Rime `InputState=All`；这不是统一状态策略的推荐，只表示本轮刻意保留用户已经适应的行为。
 
-Hyprland 若对 Shift 还有布局切换或 CapsLock 组合规则，应先检查是否抢键。原机个人 `input.lua` 的有效覆盖为：
+**重要排查：Omarchy 默认键盘选项截获 Shift**
+
+Omarchy 在 `/usr/share/omarchy/default/hypr/input.lua` 中默认配置了 `shift:both_capslock_cancel`。该选项在 XKB 层面会将实体 Shift 键的释放（release）事件拦截或映射为 CapsLock 取消动作，导致输入法（无论是 Fcitx 还是 Rime）无法稳定捕获单按 Shift 切换中英文。
+
+解决方案是在用户配置文件 `~/.config/hypr/input.lua` 中覆盖键盘选项，移除 `shift:both_capslock_cancel` 并保留 CapsLock 作为 Compose 键：
 
 ```lua
 hl.config({
@@ -263,7 +275,7 @@ hl.config({
 })
 ```
 
-不要在新电脑无条件覆盖 `kb_options`：用户可能依赖其他布局选项。保留 Caps Compose 是原用户偏好，不是中文输入的必要条件。
+保存后执行 `hyprctl reload`，并用 `hyprctl getoption input:kb_options` 确认已变为 `str: compose:caps`。如果用户有自定义多语言布局或特殊 XKB 参数，需合并原参数，不要盲目整体覆盖。
 
 ### 6.3 混输先利用现成能力
 
@@ -374,6 +386,31 @@ Chrome/Chromium 保留已有密码存储、扩展等参数，只确保对应的�
 
 启动参数改变后完全退出再打开应用。先保存未提交内容，不强制杀死用户会话。用 `hyprctl clients -j` 确认目标窗口 `xwayland=false`。字体设置改变后如果表现未更新，也要在重开应用后再判断。
 
+### 8.3 全屏 Foot 终端下候选框消失：Hyprland 单窗口直接扫描优化绕行
+
+Omarchy 默认使用 `Super + Return` 启动 foot 终端。普通窗口和按 `Super + Alt + F` 最大化时可以正常显示输入法候选窗，但在按 `Super + F` 进入真全屏后，候选窗可能会消失。
+
+**机理分析**：这不是 Fcitx5 或 Rime 的故障，而是完全不透明的全屏 foot 窗口触发了 Hyprland 的单窗口直接渲染/扫描优化（direct scanout），合成器跳过了图层合成，导致作为 Wayland layer-shell 弹出的输入法候选窗未被合成渲染。
+
+**有效规避规则**：在 `~/.config/hypr/hyprland.lua` 末尾添加如下窗口规则：
+
+```lua
+o.window("foot", {
+  opacity = "1 1 0.999 override",
+})
+```
+
+前两个 `1` 保持普通状态下的活动与非活动窗口透明度不变，第三个 `0.999 override` 将全屏透明度固定为 `0.999`。肉眼看起来仍然完全不透明，但足以阻止合成器触发单窗口直接扫描优化，让 `Super + F` 全屏状态下继续正常合成候选窗。
+
+修改后执行重载并检查：
+
+```bash
+hyprctl reload
+hyprctl configerrors
+```
+
+确保 `hyprctl configerrors` 无任何报错输出。
+
 ## 9. 长句模型：保留原版，增加可比较的备选
 
 我们使用[雾凇官方语法模型配方](https://github.com/iDvel/rime-ice/blob/main/others/recipes/grammar.recipe.yaml)推荐的万象 LTS 简体模型。它本地运行，不是调用在线大模型，也不是“上屏后预测下一词”。
@@ -452,20 +489,26 @@ __patch:
   - rime_ice.custom:/patch
   - translator/user_dict: rime_ice
     translator/contextual_suggestions: false
-    translator/max_homophones: 8
+    translator/max_homophones: 5
+    translator/max_homographs: 5
     grammar:
       language: wanxiang-lts-zh-hans
-      collocation_max_length: 6
-      collocation_min_length: 3
-      collocation_penalty: -14
-      non_collocation_penalty: -6
-      weak_collocation_penalty: -100
-      rear_penalty: -20
+      collocation_max_length: 7
+      collocation_min_length: 2
+      collocation_penalty: -10
+      non_collocation_penalty: -20
+      weak_collocation_penalty: -35
+      rear_penalty: -12
 '''
 dst.write_text(s)
 print('已生成：', dst)
 PY
 ```
+
+这里对万象模型的语法参数进行了调优：
+- `collocation_min_length: 2`（原为 3）：将搭配最小长度设为 2，使高频二字搭配也能获得语言模型打分与排序优化。
+- `weak_collocation_penalty: -35`（原为 -100）：大幅平滑弱搭配惩罚，避免合法但低频的组合被严厉抑制。
+- `translator/max_homographs: 5`：限制同形字词的最大建议数，保持候选列表精简。
 
 这里要求 `rime_ice.custom.yaml` 已存在；不启用个人模糊音的新用户也可保留一个 `patch: {}` 文件。对于其他用户复杂的个人补丁，先检查它是否覆盖模型键或方案标识，再合并。
 
@@ -522,13 +565,17 @@ gdbus call --session --dest org.fcitx.Fcitx5 \
   --method org.fcitx.Fcitx.Controller1.GetConfig fcitx://config/global
 
 gdbus call --session --dest org.fcitx.Fcitx5 \
+  --object-path /controller \
+  --method org.fcitx.Fcitx.Controller1.FullInputMethodGroupInfo "Default"
+
+gdbus call --session --dest org.fcitx.Fcitx5 \
   --object-path /rime --method org.fcitx.Fcitx.Rime1.ListAllSchemas
 
 gdbus call --session --dest org.fcitx.Fcitx5 \
   --object-path /rime --method org.fcitx.Fcitx.Rime1.GetCurrentSchema
 ```
 
-确认全局 `TriggerKeys` 只有预期框架切换键、`AltTriggerKeys` 为空；`build/default.yaml` 中两个 Shift 都为 `commit_code`。
+确认全局 `TriggerKeys` 只有预期框架切换键、`AltTriggerKeys` 为空；`build/default.yaml` 中两个 Shift 都为 `commit_code`。`FullInputMethodGroupInfo` 应确认包含 `keyboard-us` 与 `rime`。
 
 若安装了长句版，确认 `build/rime_ice_long.schema.yaml` 真正存在且含 `grammar`，并与原版比较 `speller`、`engine`、`key_binder`、`switches`，这些不应被无意改变。`build/` 是生成结果，只读取验收，不把直接编辑它作为持久配置。
 
@@ -578,4 +625,17 @@ gdbus call --session --dest org.fcitx.Fcitx5 \
 
 ## 12. 可直接交给新 Agent 的任务说明
 
-> 请按本文为当前用户配置 Fcitx5 + Rime 雾凇全拼。先识别操作系统、桌面和已有设置，做可恢复备份；只保留一个 Fcitx5 启动入口。让 Fcitx5 保留 Ctrl+Space 并清空主/备用 Shift 绑定，让 Rime 左右 Shift 使用 commit_code。保留英文混输能力，不全局提高英文优先级。为同一用户迁移时复用本文模糊音偏好。保留原生 Wayland，先用默认文字比例和适合屏幕的显示缩放验证定位，不使用 XWayland 或强制设备缩放作为默认修复。安装可选万象 LTS 长句方案，与原版共用学习库，原版排第一。执行后验证实际全局配置、生成方案、模型加载及真实输入行为。发现已有个人配置时合并而不是覆盖。交付修改摘要、备份路径、验证结果和回滚方式；不要声称尚未验证的部分已经完成。
+> 请按本文为当前用户配置 Fcitx5 + Rime 雾凇全拼。先识别操作系统、桌面和已有设置，做可恢复备份；只保留一个 Fcitx5 启动入口。覆盖 Hyprland 默认的 shift:both_capslock_cancel 键盘选项释放 Shift 键。让 Fcitx5 保留 Ctrl+Space 并清空主/备用 Shift 绑定，让 Rime 左右 Shift 使用 commit_code。保留英文混输能力，不全局提高英文优先级。为同一用户迁移时复用本文模糊音偏好。针对 foot 全屏配置 opacity 规避直接扫描导致的候选框消失。保留原生 Wayland，先用默认文字比例和适合屏幕的显示缩放验证定位，不使用 XWayland 或强制设备缩放作为默认修复。安装可选万象 LTS 长句方案，采用调优后的二字搭配参数，与原版共用学习库，原版排第一。执行后验证实际全局配置、生成方案、模型加载及真实输入行为。发现已有个人配置时合并而不是覆盖。交付修改摘要、备份路径、验证结果和回滚方式；不要声称尚未验证的部分已经完成。
+
+## 13. 参考来源与版权致谢
+
+本文在整理与实践过程中，学习并吸收了以下社区开源成果与经验，特此注明引用与致谢：
+
+- **[ManateeLazyCat: Omarchy 安装手册 (2026-09-20)](https://manateelazycat.github.io/2026/09/20/omarchy-installation-manual/)**：
+  - 学习并采纳了全屏 Foot 终端下因触发 Hyprland 单窗口直接扫描优化（direct scanout）导致 Fcitx 候选窗消失的机理分析，以及通过 `opacity = "1 1 0.999 override"` 进行平滑规避的解决方案。
+  - 参考了 Omarchy 桌面环境下的插件生态与窗口规则设计理念。
+- **[ManateeLazyCat: rime-ice-installer (GPL-3.0)](https://github.com/manateelazycat/rime-ice-installer)**：
+  - 学习并验证了 Omarchy 默认 Hyprland 键盘选项 `shift:both_capslock_cancel` 会截获实体 Shift 释放事件的深层根因，确立了在用户 `input.lua` 中使用 `kb_options = "compose:caps"` 覆盖修复的方法。
+  - 采纳了针对万象 LTS 语法模型的二字搭配优化参数（`collocation_min_length: 2` 与 `weak_collocation_penalty: -35`）及同形词限制。
+  - 采纳了基于 `ldd /usr/lib/fcitx5/librime.so` 校验动态链接完整性以防御 `opencc` soname 不匹配的检查方案，以及通过 Fcitx5 D-Bus 控制器接口进行非侵入式运行时断言的实践。
+
